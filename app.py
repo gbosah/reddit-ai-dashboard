@@ -1,254 +1,243 @@
-from flask import Flask, render_template, request, jsonify, session
+"""
+AI Trends Dashboard - Railway Deploy Ready
+"""
+import os
+from flask import Flask, render_template, request, jsonify
 from flask_socketio import SocketIO, emit
 import requests
 import json
-from datetime import datetime, timedelta
-import threading
+from datetime import datetime
 import time
-import random
+import sys
+import eventlet
+
+# Use eventlet for better WebSocket support
+eventlet.monkey_patch()
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'your-secret-key-here'  # Change this!
-socketio = SocketIO(app, cors_allowed_origins="*")
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-123')
 
-# In-memory storage for demo (use Redis/DB in production)
-trending_data = {
-    'keywords': [],
+# Configure SocketIO for Railway
+socketio = SocketIO(app, 
+                   cors_allowed_origins="*",
+                   async_mode='eventlet',
+                   logger=True,
+                   engineio_logger=False)
+
+# In-memory storage
+dashboard_data = {
+    'keywords': ['GPT', 'ChatGPT', 'OpenAI', 'AI', 'Machine Learning'],
     'posts': [],
+    'trends': [],
     'last_updated': None,
     'is_updating': False
 }
 
-# Default AI keywords to track
-DEFAULT_KEYWORDS = [
-    "GPT", "ChatGPT", "OpenAI", "Anthropic", "Claude",
-    "LLM", "AGI", "AI safety", "Machine Learning",
-    "Neural Networks", "Deep Learning", "Robotics",
-    "Computer Vision", "NLP", "Generative AI"
-]
-
-def fetch_reddit_posts(keywords, subreddits=None):
-    """Fetch posts from Reddit based on keywords"""
-    if subreddits is None:
-        subreddits = ["artificial", "MachineLearning", "singularity", "ChatGPT"]
-    
-    all_posts = []
-    
-    for subreddit in subreddits[:3]:  # Limit to 3 subreddits
-        try:
-            url = f"https://www.reddit.com/r/{subreddit}/hot.json?limit=20"
-            headers = {'User-Agent': 'AI-Dashboard/1.0'}
-            response = requests.get(url, headers=headers, timeout=5)
-            
-            if response.status_code == 200:
-                data = response.json()
-                for post in data['data']['children']:
-                    post_data = post['data']
-                    title = post_data['title'].lower()
-                    
-                    # Check if post contains any of our keywords
-                    for keyword in keywords:
-                        if keyword.lower() in title:
-                            all_posts.append({
-                                'id': post_data['id'],
-                                'title': post_data['title'],
-                                'subreddit': subreddit,
-                                'upvotes': post_data['ups'],
-                                'comments': post_data['num_comments'],
-                                'url': f"https://reddit.com{post_data['permalink']}",
-                                'created': datetime.fromtimestamp(post_data['created_utc']).strftime('%H:%M'),
-                                'keyword_matched': keyword,
-                                'engagement': post_data['ups'] + (post_data['num_comments'] * 0.3)
-                            })
-                            break  # Stop checking other keywords for this post
-            
-            time.sleep(0.5)  # Be nice to Reddit
+def fetch_reddit_safe(subreddit="artificial", limit=15):
+    """Safe Reddit API fetch with error handling"""
+    try:
+        url = f"https://www.reddit.com/r/{subreddit}/hot.json?limit={limit}"
+        headers = {'User-Agent': 'Railway-AI-Dashboard/1.0'}
         
-        except Exception as e:
-            print(f"Error fetching from r/{subreddit}: {e}")
-            continue
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            return response.json()
+        else:
+            print(f"Reddit API error: {response.status_code}")
+            return None
+            
+    except Exception as e:
+        print(f"Fetch error: {e}")
+        return None
+
+def process_posts(reddit_data, keywords):
+    """Process Reddit data"""
+    if not reddit_data or 'data' not in reddit_data:
+        return []
     
-    return all_posts
+    posts = []
+    
+    for item in reddit_data['data']['children'][:12]:
+        post = item['data']
+        
+        # Find matching keyword
+        matched_keyword = 'AI'
+        title_lower = post['title'].lower()
+        
+        for keyword in keywords:
+            if keyword.lower() in title_lower:
+                matched_keyword = keyword
+                break
+        
+        posts.append({
+            'id': post['id'],
+            'title': post['title'],
+            'subreddit': post.get('subreddit', 'artificial'),
+            'upvotes': post.get('ups', 0),
+            'comments': post.get('num_comments', 0),
+            'url': f"https://reddit.com{post.get('permalink', '')}",
+            'created': datetime.fromtimestamp(post.get('created_utc', time.time())).strftime('%H:%M'),
+            'keyword_matched': matched_keyword,
+            'engagement': post.get('ups', 0) + (post.get('num_comments', 0) * 0.3)
+        })
+    
+    return posts
 
 def analyze_trends(posts, keywords):
-    """Analyze posts to find trends"""
-    keyword_counts = {keyword: 0 for keyword in keywords}
-    keyword_engagement = {keyword: 0 for keyword in keywords}
+    """Analyze trends from posts"""
+    if not posts:
+        return []
     
+    keyword_counts = {}
     for post in posts:
         keyword = post['keyword_matched']
-        if keyword in keyword_counts:
-            keyword_counts[keyword] += 1
-            keyword_engagement[keyword] += post['engagement']
+        keyword_counts[keyword] = keyword_counts.get(keyword, 0) + 1
     
-    # Calculate trends
     trends = []
-    for keyword in keywords:
-        if keyword_counts[keyword] > 0:
-            avg_engagement = keyword_engagement[keyword] / keyword_counts[keyword] if keyword_counts[keyword] > 0 else 0
+    for keyword, count in keyword_counts.items():
+        if count > 0:
             trends.append({
                 'keyword': keyword,
-                'count': keyword_counts[keyword],
-                'engagement': round(avg_engagement, 1),
-                'trend': '🔥' if keyword_counts[keyword] >= 3 else ('📈' if keyword_counts[keyword] >= 2 else '📊')
+                'count': count,
+                'trend': '🔥' if count >= 3 else ('📈' if count >= 2 else '📊')
             })
     
-    # Sort by count then engagement
-    trends.sort(key=lambda x: (x['count'], x['engagement']), reverse=True)
-    return trends[:10]  # Top 10
+    trends.sort(key=lambda x: x['count'], reverse=True)
+    return trends[:8]
 
-def update_data_thread(keywords):
-    """Background thread to update data"""
-    global trending_data
+def update_data():
+    """Update dashboard data"""
+    if dashboard_data['is_updating']:
+        return False
     
-    trending_data['is_updating'] = True
-    socketio.emit('update_status', {'status': 'updating', 'message': 'Fetching new data...'})
+    dashboard_data['is_updating'] = True
     
     try:
-        # Fetch new posts
-        posts = fetch_reddit_posts(keywords)
+        # Fetch from Reddit
+        reddit_data = fetch_reddit_safe()
         
-        # Analyze trends
-        trends = analyze_trends(posts, keywords)
-        
-        # Sort posts by engagement
-        posts.sort(key=lambda x: x['engagement'], reverse=True)
-        
-        # Update global data
-        trending_data.update({
-            'keywords': trends,
-            'posts': posts[:15],  # Top 15 posts
-            'last_updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'is_updating': False
-        })
-        
-        # Send update to all connected clients
-        socketio.emit('data_update', {
-            'keywords': trends,
-            'posts': posts[:10],
-            'last_updated': trending_data['last_updated']
-        })
-        
-        socketio.emit('update_status', {'status': 'complete', 'message': 'Data updated successfully!'})
+        if reddit_data:
+            # Process data
+            posts = process_posts(reddit_data, dashboard_data['keywords'])
+            trends = analyze_trends(posts, dashboard_data['keywords'])
+            
+            # Update dashboard
+            dashboard_data['posts'] = posts
+            dashboard_data['trends'] = trends
+            dashboard_data['last_updated'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Notify WebSocket clients
+            socketio.emit('data_update', {
+                'keywords': trends,
+                'posts': posts[:10],
+                'last_updated': dashboard_data['last_updated']
+            })
+            
+            print(f"✅ Updated: {len(posts)} posts, {len(trends)} trends")
+            return True
+        return False
         
     except Exception as e:
-        print(f"Error in update thread: {e}")
-        trending_data['is_updating'] = False
-        socketio.emit('update_status', {'status': 'error', 'message': f'Error: {str(e)}'})
+        print(f"❌ Update error: {e}")
+        return False
+    finally:
+        dashboard_data['is_updating'] = False
+
+# ========== ROUTES ==========
 
 @app.route('/')
 def index():
     """Main page"""
-    return render_template('index.html', default_keywords=DEFAULT_KEYWORDS)
+    if not dashboard_data['posts']:
+        update_data()
+    
+    return render_template('index.html',
+                         default_keywords=dashboard_data['keywords'],
+                         last_updated=dashboard_data['last_updated'])
 
-@app.route('/api/trends', methods=['GET'])
-def get_trends():
-    """API endpoint to get current trends"""
-    return jsonify(trending_data)
+@app.route('/api/data')
+def get_data():
+    """API endpoint for data"""
+    return jsonify({
+        'success': True,
+        'data': {
+            'keywords': dashboard_data['trends'],
+            'posts': dashboard_data['posts'][:10],
+            'last_updated': dashboard_data['last_updated'],
+            'stats': {
+                'total_posts': len(dashboard_data['posts']),
+                'total_keywords': len(dashboard_data['keywords'])
+            }
+        }
+    })
 
-@app.route('/api/update', methods=['POST'])
-def update_trends():
-    """API endpoint to manually update trends"""
-    data = request.json
-    keywords = data.get('keywords', DEFAULT_KEYWORDS)
-    
-    if trending_data['is_updating']:
-        return jsonify({'status': 'error', 'message': 'Update already in progress'})
-    
-    # Start update in background thread
-    thread = threading.Thread(target=update_data_thread, args=(keywords,))
-    thread.daemon = True
-    thread.start()
-    
-    return jsonify({'status': 'success', 'message': 'Update started'})
-
-@app.route('/api/search', methods=['POST'])
-def search_keyword():
-    """Search for specific keyword"""
-    data = request.json
-    keyword = data.get('keyword', '').strip()
-    
-    if not keyword:
-        return jsonify({'status': 'error', 'message': 'Keyword required'})
-    
-    # Add keyword to list and search
-    keywords = DEFAULT_KEYWORDS + [keyword]
-    posts = fetch_reddit_posts([keyword])
+@app.route('/api/update', methods=['GET', 'POST'])
+def update_endpoint():
+    """Trigger update"""
+    success = update_data()
     
     return jsonify({
-        'status': 'success',
-        'keyword': keyword,
-        'posts': posts[:10],
-        'count': len(posts)
+        'success': success,
+        'message': 'Updated' if success else 'Failed',
+        'last_updated': dashboard_data['last_updated']
     })
+
+@app.route('/api/health')
+def health():
+    """Health check"""
+    return jsonify({
+        'status': 'ok',
+        'service': 'AI Trends Dashboard',
+        'timestamp': datetime.now().isoformat(),
+        'version': '1.0.0'
+    })
+
+# ========== SOCKET.IO EVENTS ==========
 
 @socketio.on('connect')
 def handle_connect():
-    """Handle new client connection"""
+    """Handle client connection"""
     print(f"Client connected: {request.sid}")
-    emit('connected', {'message': 'Connected to AI Trends Dashboard'})
+    emit('connected', {'message': 'Connected to AI Dashboard'})
     
-    # Send current data to new client
-    if trending_data['last_updated']:
+    # Send current data
+    if dashboard_data['last_updated']:
         emit('data_update', {
-            'keywords': trending_data['keywords'],
-            'posts': trending_data['posts'][:10],
-            'last_updated': trending_data['last_updated']
+            'keywords': dashboard_data['trends'],
+            'posts': dashboard_data['posts'][:10],
+            'last_updated': dashboard_data['last_updated']
         })
 
 @socketio.on('request_update')
-def handle_update_request():
-    """Handle update request from client"""
-    if not trending_data['is_updating']:
-        thread = threading.Thread(target=update_data_thread, args=(DEFAULT_KEYWORDS,))
-        thread.daemon = True
-        thread.start()
-        emit('update_status', {'status': 'started', 'message': 'Update initiated'})
+def handle_update():
+    """Handle update request"""
+    if not dashboard_data['is_updating']:
+        emit('update_status', {'status': 'updating', 'message': 'Fetching data...'})
+        update_data()
+        emit('update_status', {'status': 'complete', 'message': 'Data updated!'})
+
+# ========== INITIALIZATION ==========
 
 if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    
+    print("=" * 50)
+    print("🤖 AI Trends Dashboard - Railway Ready")
+    print("=" * 50)
+    print(f"Port: {port}")
+    print(f"Python: {sys.version.split()[0]}")
+    
     # Initial data fetch
-    print("Starting initial data fetch...")
-    initial_thread = threading.Thread(target=update_data_thread, args=(DEFAULT_KEYWORDS,))
-    initial_thread.daemon = True
-    initial_thread.start()
+    print("Fetching initial data...")
+    update_data()
     
-    print("Starting server on http://localhost:5000")
-    socketio.run(app, debug=True, port=5000)
-
-    # Add this function to app.py
-def get_chart_data(keywords, posts):
-    """Generate data for charts"""
-    if not posts:
-        return {
-            'trend_data': [0, 0, 0, 0, 0],
-            'engagement_distribution': [0, 0, 0],
-            'keyword_frequency': {}
-        }
+    print(f"\n🚀 Server starting on port {port}")
+    print("👉 Open your browser to the Railway URL")
     
-    # Trend data (simulated for now - in production, store historical data)
-    trend_data = [len(posts)] * 5
-    
-    # Engagement distribution
-    high = sum(1 for p in posts if p['engagement'] > 100)
-    medium = sum(1 for p in posts if p['engagement'] > 50)
-    low = sum(1 for p in posts if p['engagement'] <= 50)
-    
-    # Keyword frequency
-    keyword_freq = {}
-    for keyword in keywords:
-        count = sum(1 for p in posts if p['keyword_matched'] == keyword)
-        if count > 0:
-            keyword_freq[keyword] = count
-    
-    return {
-        'trend_data': trend_data,
-        'engagement_distribution': [high, medium, low],
-        'keyword_frequency': keyword_freq
-    }
-
-# Add new API endpoint for chart data
-@app.route('/api/chart-data', methods=['GET'])
-def get_chart_data_endpoint():
-    """API endpoint for chart data"""
-    chart_data = get_chart_data(DEFAULT_KEYWORDS, trending_data.get('posts', []))
-    return jsonify(chart_data)
+    # Use socketio.run instead of app.run for WebSockets
+    socketio.run(app, 
+                 host='0.0.0.0', 
+                 port=port,
+                 debug=False,
+                 allow_unsafe_werkzeug=True)
